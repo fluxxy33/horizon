@@ -326,9 +326,8 @@ fn reference(columns: &Columns, camera: DVec3, radius: i32, rays: bool) -> Vec<b
         let node = &nodes[&key];
         let (directions, sources) = (node.directions, node.sources);
         let vis = columns.get(key);
-        let distant = (key.0 - from.0).abs() > 3
-            || (key.1 - from.1).abs() > 3
-            || (key.2 - from.2).abs() > 3;
+        let distant =
+            (key.0 - from.0).abs() > 3 || (key.1 - from.1).abs() > 3 || (key.2 - from.2).abs() > 3;
         for (d, step) in STEPS.iter().enumerate() {
             let next = (key.0 + step.0, key.1 + step.1, key.2 + step.2);
             if next.1 < -1 || next.1 > columns.sections || index(next).is_none() {
@@ -339,8 +338,7 @@ fn reference(columns: &Columns, camera: DVec3, radius: i32, rays: bool) -> Vec<b
             }
             // facesCanSeeEachother(source.getOpposite(), direction).
             if sources != 0
-                && !(0..6)
-                    .any(|s| sources & (1 << s) != 0 && vis & (1 << ((s ^ 1) * 6 + d)) != 0)
+                && !(0..6).any(|s| sources & (1 << s) != 0 && vis & (1 << ((s ^ 1) * 6 + d)) != 0)
             {
                 continue;
             }
@@ -1190,10 +1188,10 @@ fn differential_search_negative_coords_sparse_and_dense() {
             for x in from.0 - radius..=from.0 + radius {
                 for z in from.2 - radius..=from.2 + radius {
                     for y in -1..=o.columns.sections {
-                        let expected =
-                            full[(((z - from.2 + radius) * side + x - from.0 + radius) * full_h
-                                + y
-                                + 1) as usize];
+                        let expected = full[(((z - from.2 + radius) * side + x - from.0 + radius)
+                            * full_h
+                            + y
+                            + 1) as usize];
                         let actual = o.contains((x, y, z));
                         if g.height == full_h {
                             assert_eq!(
@@ -1247,8 +1245,8 @@ fn differential_search_negative_coords_sparse_and_dense() {
     for x in from.0 - 6..=from.0 + 6 {
         for z in from.2 - 6..=from.2 + 6 {
             for y in -1..=24 {
-                let expected = full
-                    [(((z - from.2 + 6) * side + x - from.0 + 6) * full_h + y + 1) as usize];
+                let expected =
+                    full[(((z - from.2 + 6) * side + x - from.0 + 6) * full_h + y + 1) as usize];
                 let actual = o.contains((x, y, z));
                 assert!(!expected || actual, "hid ({x},{y},{z})");
                 if actual && !expected {
@@ -1281,12 +1279,7 @@ fn differential_propagate_changes_matches_reference_partial_update() {
         sections: i32,
     }
 
-    fn set_both(
-        o: &mut Occlusion,
-        vis_map: &mut HashMap<SectionKey, u64>,
-        k: SectionKey,
-        v: u64,
-    ) {
+    fn set_both(o: &mut Occlusion, vis_map: &mut HashMap<SectionKey, u64>, k: SectionKey, v: u64) {
         o.set(k, v);
         if v == ALL_VISIBLE {
             vis_map.remove(&k);
@@ -1728,8 +1721,8 @@ fn rd32_toroidal_wraparound_and_zero_alloc_scratch_reuse() {
     for x in from.0 - 6..=from.0 + 6 {
         for z in from.2 - 6..=from.2 + 6 {
             for y in -1..=o.columns.sections {
-                let expected = full
-                    [(((z - from.2 + 6) * side + x - from.0 + 6) * full_h + y + 1) as usize];
+                let expected =
+                    full[(((z - from.2 + 6) * side + x - from.0 + 6) * full_h + y + 1) as usize];
                 let actual = o.contains((x, y, z));
                 assert!(!expected || actual, "wrapped search hid ({x},{y},{z})");
                 if actual && !expected {
