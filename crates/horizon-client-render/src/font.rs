@@ -16,7 +16,8 @@ use ab_glyph::{Font as _, ScaleFont as _};
 use std::{
     borrow::Cow,
     cell::RefCell,
-    collections::HashMap,
+    collections::{HashMap, HashSet},
+    rc::Rc,
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -639,46 +640,129 @@ pub(crate) fn font_file_error(providers: &serde_json::Value) -> Option<String> {
         .flatten()
         .find_map(bitmap_error)
 }
+/// A bound on what one font takes in through `reference` providers: each reference followed and
+/// each provider it brings in count one. Vanilla's `default` takes in a few dozen
+/// (`include/default`, `include/space`, `include/unifont`); a server pack that keeps one bitmap
+/// provider per glyph in an included font takes in thousands to tens of thousands (the first
+/// plane's private use area alone has 6400 code points), which fits; an included font with more
+/// than about 65000 providers is cut. A font's own providers never count, so a pack that lists
+/// every glyph in `font/default.json` keeps them all. Without the bound, a font that names
+/// another several times at each level of nesting would copy its providers exponentially. It
+/// is not higher because `load_bitmap` reads and decodes an off-atlas sheet again for every
+/// copy of its provider.
+const MAX_REFERENCED_PROVIDERS: usize = 1 << 16;
+
 /// Providers of a font definition with references expanded, in order, with
-/// their `filter` objects.
-fn providers(source: &ResourceSource, id: &str, depth: u32, out: &mut Vec<serde_json::Value>) {
-    if depth > 8 {
-        return;
-    }
-    let path = resource_path(id, "font", ".json");
-    let Some(def) = read_json(source, &path) else {
-        return;
+/// their `filter` objects. Each font file is read once per load, however often
+/// and under whichever spelling (`default`, `minecraft:default`) it is named:
+/// `FontManager` builds each font once. A reference back to a font that is
+/// still being expanded is a cycle and adds nothing. Vanilla drops the whole
+/// font instead, as it does for a reference to a missing font; Horizon keeps
+/// the font's other providers in both cases.
+fn providers(source: &ResourceSource, id: &str) -> Vec<serde_json::Value> {
+    let mut walk = ReferenceWalk {
+        source,
+        files: HashMap::new(),
+        open: Vec::new(),
+        budget: MAX_REFERENCED_PROVIDERS,
+        logged: HashSet::new(),
     };
-    if let Some(error) = font_file_error(&def["providers"]) {
-        log::error!("font {path} skipped: {error}");
-        return;
+    let mut out = Vec::new();
+    walk.expand(&resource_path(id, "font", ".json"), 0, &mut out);
+    out
+}
+/// One font's expansion: the files read so far and the references followed.
+struct ReferenceWalk<'a> {
+    source: &'a ResourceSource,
+    /// Each font file's providers by path, `None` when it is missing or refused.
+    files: HashMap<String, Option<Rc<Vec<serde_json::Value>>>>,
+    /// Paths of the fonts being expanded, outermost first.
+    open: Vec<String>,
+    /// References and referenced providers still allowed (`MAX_REFERENCED_PROVIDERS`).
+    budget: usize,
+    /// Fonts whose cycle, and the font whose cut, were logged already.
+    logged: HashSet<String>,
+}
+impl ReferenceWalk<'_> {
+    fn file(&mut self, path: &str) -> Option<Rc<Vec<serde_json::Value>>> {
+        if let Some(file) = self.files.get(path) {
+            return file.clone();
+        }
+        #[cfg(test)]
+        tests::record_font_read();
+        let file = read_json(self.source, path).and_then(|mut def| {
+            if let Some(error) = font_file_error(&def["providers"]) {
+                log::error!("font {path} skipped: {error}");
+                return None;
+            }
+            let list = match def.get_mut("providers").map(serde_json::Value::take) {
+                Some(serde_json::Value::Array(list)) => list,
+                _ => Vec::new(),
+            };
+            Some(Rc::new(list))
+        });
+        self.files.insert(path.to_owned(), file.clone());
+        file
     }
-    for p in def["providers"].as_array().into_iter().flatten() {
-        if p["type"] == "reference" {
-            let mut nested = Vec::new();
-            providers(
-                source,
-                p["id"].as_str().unwrap_or(""),
-                depth + 1,
-                &mut nested,
+    fn cut(&mut self) {
+        let top = self.open.first().cloned().unwrap_or_default();
+        if self.logged.insert(format!("cut {top}")) {
+            log::error!(
+                "font {top}: references past {MAX_REFERENCED_PROVIDERS} providers left out"
             );
-            for mut n in nested {
+        }
+    }
+    fn expand(&mut self, path: &str, depth: u32, out: &mut Vec<serde_json::Value>) {
+        if depth > 8 {
+            return;
+        }
+        let Some(list) = self.file(path) else {
+            return;
+        };
+        self.open.push(path.to_owned());
+        for p in list.iter() {
+            if p["type"] == "reference" {
+                if self.budget == 0 {
+                    self.cut();
+                    continue;
+                }
+                self.budget -= 1;
+                let target = resource_path(p["id"].as_str().unwrap_or(""), "font", ".json");
+                if self.open.contains(&target) {
+                    if self.logged.insert(format!("cycle {target}")) {
+                        log::error!(
+                            "font {target} skipped where {path} references it: \
+                             it references itself through {}",
+                            self.open.join(" -> ")
+                        );
+                    }
+                    continue;
+                }
+                let start = out.len();
+                self.expand(&target, depth + 1, out);
                 // A reference's filter applies to everything it includes.
                 if let Some(f) = p["filter"].as_object() {
-                    let merged = n["filter"]
-                        .as_object()
-                        .cloned()
-                        .unwrap_or_default()
-                        .into_iter()
-                        .chain(f.clone())
-                        .collect();
-                    n["filter"] = serde_json::Value::Object(merged);
+                    for n in out[start..].iter_mut().filter(|n| n.is_object()) {
+                        let merged = n["filter"]
+                            .as_object()
+                            .cloned()
+                            .unwrap_or_default()
+                            .into_iter()
+                            .chain(f.clone())
+                            .collect();
+                        n["filter"] = serde_json::Value::Object(merged);
+                    }
                 }
-                out.push(n);
+            } else if depth == 0 {
+                out.push(p.clone());
+            } else if self.budget > 0 {
+                self.budget -= 1;
+                out.push(p.clone());
+            } else {
+                self.cut();
             }
-        } else {
-            out.push(p.clone());
         }
+        self.open.pop();
     }
 }
 // FontTexture.add nudges UVs inside the glyph to avoid neighboring texels.
@@ -1383,8 +1467,7 @@ impl Font {
     }
     /// `FontManager`: a font's providers with references expanded.
     fn load_set(&self, id: &str, pixels: &[u8]) -> FontSet {
-        let mut all = Vec::new();
-        providers(&self.source, id, 0, &mut all);
+        let all = providers(&self.source, id);
         let providers = all
             .iter()
             .filter_map(|p| match p["type"].as_str()? {

@@ -7,6 +7,172 @@ thread_local! {
 pub(super) fn record_strip_decoded(bytes: usize) {
     STRIP_DECODED_BYTES.with(|total| total.set(total.get().saturating_add(bytes)));
 }
+thread_local! {
+    static FONT_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+pub(super) fn record_font_read() {
+    FONT_READS.with(|reads| reads.set(reads.get() + 1));
+}
+/// A pack's fonts as files: `(id, providers)`.
+fn font_pack(fonts: &[(String, serde_json::Value)]) -> ResourceSource {
+    use horizon_assets::resource_source::Resource;
+    ResourceSource::indexed(
+        fonts
+            .iter()
+            .map(|(id, providers)| {
+                let file = serde_json::json!({ "providers": providers });
+                (
+                    resource_path(id, "font", ".json"),
+                    Resource::bytes(file.to_string().into_bytes()),
+                )
+            })
+            .collect(),
+    )
+}
+/// The providers `id` expands to and how many font files that read.
+fn expand_counting(source: &ResourceSource, id: &str) -> (Vec<serde_json::Value>, usize) {
+    FONT_READS.with(|reads| reads.set(0));
+    let out = providers(source, id);
+    (out, FONT_READS.with(std::cell::Cell::get))
+}
+fn space(c: &str) -> serde_json::Value {
+    serde_json::json!({ "type": "space", "advances": { c: 4 } })
+}
+fn reference(id: &str) -> serde_json::Value {
+    serde_json::json!({ "type": "reference", "id": id })
+}
+/// The first advance character of each space provider.
+fn advances(out: &[serde_json::Value]) -> Vec<&str> {
+    out.iter()
+        .map(|p| {
+            p["advances"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .next()
+                .unwrap()
+                .as_str()
+        })
+        .collect()
+}
+/// `l0` to `l{levels}`: each level names the next `fan` times, the last holds one space provider.
+fn fan_out(fan: usize, levels: usize) -> Vec<(String, serde_json::Value)> {
+    let mut fonts: Vec<(String, serde_json::Value)> = (0..levels)
+        .map(|k| {
+            let next = reference(&format!("minecraft:l{}", k + 1));
+            (
+                format!("minecraft:l{k}"),
+                serde_json::Value::Array(vec![next; fan]),
+            )
+        })
+        .collect();
+    fonts.push((
+        format!("minecraft:l{levels}"),
+        serde_json::json!([space(" ")]),
+    ));
+    fonts
+}
+
+#[test]
+fn each_referenced_font_is_read_once_however_often_it_is_named() {
+    // Every copy is still listed (vanilla lists a font once per reference), but each file is
+    // read once: one read per level, not one per path to it (40 and 121 before).
+    let (three, reads) = expand_counting(&font_pack(&fan_out(3, 3)), "minecraft:l0");
+    assert_eq!((three.len(), reads), (27, 4));
+    let (four, reads) = expand_counting(&font_pack(&fan_out(3, 4)), "minecraft:l0");
+    assert_eq!((four.len(), reads), (81, 5));
+}
+
+#[test]
+fn spellings_of_one_font_are_one_file() {
+    let source = font_pack(&[
+        (
+            "minecraft:default".into(),
+            serde_json::json!([
+                reference("x"),
+                reference("minecraft:x"),
+                reference("x.json")
+            ]),
+        ),
+        ("minecraft:x".into(), serde_json::json!([space("a")])),
+        (
+            "minecraft:loop".into(),
+            serde_json::json!([reference("loop.json"), space("b")]),
+        ),
+    ]);
+    let (out, reads) = expand_counting(&source, "default");
+    assert_eq!((advances(&out), reads), (vec!["a", "a", "a"], 2));
+    // A reference to itself under another spelling is a cycle, not nine nested copies.
+    let (out, reads) = expand_counting(&source, "minecraft:loop");
+    assert_eq!((advances(&out), reads), (vec!["b"], 1));
+}
+
+#[test]
+fn a_font_keeps_all_its_own_providers_past_the_reference_budget() {
+    let mut own: Vec<serde_json::Value> =
+        (0..=MAX_REFERENCED_PROVIDERS).map(|_| space("a")).collect();
+    own.push(reference("minecraft:z"));
+    let source = font_pack(&[
+        ("minecraft:default".into(), serde_json::Value::Array(own)),
+        ("minecraft:z".into(), serde_json::json!([space("z")])),
+    ]);
+    let (out, _) = expand_counting(&source, "minecraft:default");
+    assert_eq!(out.len(), MAX_REFERENCED_PROVIDERS + 2);
+    assert_eq!(advances(&out).last(), Some(&"z"));
+}
+
+#[test]
+fn a_deep_fan_out_stops_at_the_reference_budget() {
+    // 10^8 copies of the last level's provider without a bound.
+    let mut fonts = fan_out(10, 8);
+    fonts[0].1.as_array_mut().unwrap().push(space("end"));
+    let (out, reads) = expand_counting(&font_pack(&fonts), "minecraft:l0");
+    assert_eq!(reads, 9);
+    assert!(out.len() <= MAX_REFERENCED_PROVIDERS + 1, "{}", out.len());
+    // The font's own provider after its references stays.
+    assert_eq!(advances(&out).last(), Some(&"end"));
+}
+
+#[test]
+fn a_font_that_references_itself_keeps_its_other_providers() {
+    let source = font_pack(&[
+        (
+            "minecraft:default".into(),
+            serde_json::json!([
+                reference("minecraft:default"),
+                reference("minecraft:loop"),
+                { "type": "reference", "id": "minecraft:space", "filter": { "uniform": false } },
+                space("a"),
+            ]),
+        ),
+        (
+            "minecraft:loop".into(),
+            serde_json::json!([reference("default"), space("b")]),
+        ),
+        ("minecraft:space".into(), serde_json::json!([space("c")])),
+    ]);
+    let (out, _) = expand_counting(&source, "minecraft:default");
+    // The cycles add nothing; `loop`'s own provider and the filtered reference stay, in order.
+    assert_eq!(advances(&out), ["b", "c", "a"]);
+    assert_eq!(out[1]["filter"], serde_json::json!({ "uniform": false }));
+}
+
+#[test]
+fn a_filtered_reference_to_a_font_with_a_provider_that_is_not_an_object_loads() {
+    let source = font_pack(&[
+        (
+            "minecraft:default".into(),
+            serde_json::json!([{ "type": "reference", "id": "x", "filter": { "jp": true } }]),
+        ),
+        (
+            "minecraft:x".into(),
+            serde_json::json!(["not a provider", space("a")]),
+        ),
+    ]);
+    let (out, _) = expand_counting(&source, "minecraft:default");
+    assert_eq!(out[1]["filter"], serde_json::json!({ "jp": true }));
+}
+
 fn measure_decoded_bytes<R>(f: impl FnOnce() -> R) -> (R, usize) {
     STRIP_DECODED_BYTES.with(|total| total.set(0));
     let out = f();
