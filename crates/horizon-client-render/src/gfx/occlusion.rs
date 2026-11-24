@@ -46,13 +46,159 @@ const SEES: u8 = u8::MAX;
 /// Edits kept before a full resend.
 const EDIT_CAP: usize = 1 << 16;
 
+/// Sentinel slab slot index meaning no column is stored.
+const EMPTY_SLOT: u32 = u32::MAX;
+/// Initial toroidal grid shift (16x16 = 256 cells, 4 KiB).
+const MIN_GRID_SHIFT: u8 = 4;
+/// Largest toroidal grid kept across `clear` (128x128 = 16,384 cells, 256 KiB;
+/// covers render distance 32+ with zero collisions).
+const KEEP_GRID_MAX_LEN: usize = 1 << (7 * 2);
+
+#[derive(Clone, Copy)]
+struct GridSlot {
+    key_packed: u64,
+    /// Slab slot index of the cached resident column, or `EMPTY_SLOT`.
+    slot: u32,
+    /// Number of other resident columns in `Columns::map` hashing to this
+    /// toroidal cell. When 0, this cell is authoritative: a miss proves the
+    /// column is absent without probing `map`.
+    overflow: u32,
+}
+
+impl GridSlot {
+    const EMPTY: Self = Self {
+        key_packed: 0,
+        slot: EMPTY_SLOT,
+        overflow: 0,
+    };
+}
+
+#[inline(always)]
+fn pack_key(wx: i32, wz: i32) -> u64 {
+    u64::from(wx as u32) | (u64::from(wz as u32) << 32)
+}
+
+#[inline(always)]
+fn grid_index(wx: i32, wz: i32, mask: i32, shift: u8) -> usize {
+    (((wz & mask) as usize) << shift) | ((wx & mask) as usize)
+}
+
+#[inline]
+fn desired_grid_shift(count: usize) -> u8 {
+    if count > 8192 {
+        8
+    } else if count > 2048 {
+        7
+    } else if count > 512 {
+        6
+    } else if count > 128 {
+        5
+    } else {
+        MIN_GRID_SHIFT
+    }
+}
+
+/// Contiguous slab storing per-column section visibility masks (`rows`) and
+/// each column's highest non-air section index (`max_non_air`), eliminating
+/// one `Box<[u64]>` allocation per loaded column.
+struct ColumnSlab {
+    /// Sections per column (`sections.max(0) as usize`).
+    stride: usize,
+    /// Contiguous `[slot * stride + y]` visibility masks.
+    rows: Vec<u64>,
+    /// Per-slot highest `y` whose visibility mask is not `ALL_VISIBLE`,
+    /// saturated at `u8::MAX` when `stride > 256`.
+    max_non_air: Vec<u8>,
+    /// Recycled slot indices freed when columns become fully open or unload.
+    free_slots: Vec<u32>,
+}
+
+impl ColumnSlab {
+    fn new(sections: i32) -> Self {
+        Self {
+            stride: sections.max(0) as usize,
+            rows: Vec::new(),
+            max_non_air: Vec::new(),
+            free_slots: Vec::new(),
+        }
+    }
+
+    fn alloc(&mut self) -> u32 {
+        if let Some(slot) = self.free_slots.pop() {
+            let base = slot as usize * self.stride;
+            self.rows[base..base + self.stride].fill(ALL_VISIBLE);
+            self.max_non_air[slot as usize] = 0;
+            slot
+        } else {
+            let slot =
+                u32::try_from(self.max_non_air.len()).expect("occlusion column slab overflow");
+            assert!(slot != EMPTY_SLOT, "occlusion column slab overflow");
+            self.rows.resize(self.rows.len() + self.stride, ALL_VISIBLE);
+            self.max_non_air.push(0);
+            slot
+        }
+    }
+
+    #[inline]
+    fn free(&mut self, slot: u32) {
+        self.free_slots.push(slot);
+    }
+
+    #[inline]
+    fn column(&self, slot: u32) -> &[u64] {
+        let base = slot as usize * self.stride;
+        &self.rows[base..base + self.stride]
+    }
+
+    /// Number of bottom sections that may differ from `ALL_VISIBLE`.
+    #[inline]
+    fn scan_len(&self, slot: u32) -> usize {
+        let m = usize::from(self.max_non_air[slot as usize]);
+        if m == usize::from(u8::MAX) && self.stride > 256 {
+            self.stride
+        } else {
+            m + 1
+        }
+    }
+
+    /// Exact highest non-air section `y` for `slot` when `stride > 256` and
+    /// `max_non_air[slot]` saturated at `u8::MAX`.
+    #[cold]
+    fn exact_max_non_air_y(&self, slot: u32) -> i32 {
+        self.column(slot)
+            .iter()
+            .rposition(|&v| v != ALL_VISIBLE)
+            .unwrap_or(0) as i32
+    }
+
+    fn clear(&mut self) {
+        let shrink = self.max_non_air.capacity() > KEEP_GRID_MAX_LEN;
+        self.rows.clear();
+        self.max_non_air.clear();
+        self.free_slots.clear();
+        if shrink {
+            self.rows.shrink_to_fit();
+            self.max_non_air.shrink_to_fit();
+            self.free_slots.shrink_to_fit();
+        }
+    }
+}
+
 /// VisGraph connectivity per column, one entry per section (bottom first).
 /// A missing column or section connects every face.
 struct Columns {
     /// The lowest block y of section 0 (`Level.getMinY`).
     min_y: i32,
     sections: i32,
-    map: FxHashMap<(i32, i32), Box<[u64]>>,
+    slab: ColumnSlab,
+    /// Toroidal power-of-two direct-mapped cache for O(1) hash-free column
+    /// lookups (`(wz & grid_mask) << grid_shift | (wx & grid_mask)`).
+    grid: Box<[GridSlot]>,
+    grid_mask: i32,
+    grid_shift: u8,
+    /// Authoritative `(wx, wz) -> slab slot` index for toroidal collisions
+    /// (`overflow > 0`) and full scans/resyncs.
+    map: FxHashMap<(i32, i32), u32>,
 }
 
 impl Columns {
@@ -60,6 +206,10 @@ impl Columns {
         Self {
             min_y,
             sections,
+            slab: ColumnSlab::new(sections),
+            grid: Box::new([]),
+            grid_mask: 0,
+            grid_shift: 0,
             map: FxHashMap::default(),
         }
     }
@@ -71,44 +221,262 @@ impl Columns {
             (pos.z.floor() as i32) >> 4,
         )
     }
+    fn rebuild_grid(&mut self, shift: u8) {
+        let side = 1usize << shift;
+        let len = side * side;
+        if self.grid.len() != len {
+            self.grid = vec![GridSlot::EMPTY; len].into_boxed_slice();
+        } else {
+            self.grid.fill(GridSlot::EMPTY);
+        }
+        self.grid_shift = shift;
+        self.grid_mask = (side - 1) as i32;
+        for (&(wx, wz), &slot) in &self.map {
+            let idx = grid_index(wx, wz, self.grid_mask, self.grid_shift);
+            let cell = &mut self.grid[idx];
+            if cell.slot != EMPTY_SLOT {
+                cell.overflow += 1;
+            }
+            cell.key_packed = pack_key(wx, wz);
+            cell.slot = slot;
+        }
+    }
+    fn insert_grid_new(&mut self, wx: i32, wz: i32, slot: u32) {
+        let target = desired_grid_shift(self.map.len());
+        if self.grid_mask == 0 || target > self.grid_shift {
+            self.rebuild_grid(target);
+            return;
+        }
+        let idx = grid_index(wx, wz, self.grid_mask, self.grid_shift);
+        let cell = &mut self.grid[idx];
+        if cell.slot != EMPTY_SLOT {
+            cell.overflow += 1;
+        }
+        cell.key_packed = pack_key(wx, wz);
+        cell.slot = slot;
+    }
+    #[inline(always)]
+    fn get_slot(&self, wx: i32, wz: i32) -> u32 {
+        let mask = self.grid_mask;
+        if mask == 0 {
+            debug_assert!(self.map.is_empty());
+            return EMPTY_SLOT;
+        }
+        let cell = self.grid[grid_index(wx, wz, mask, self.grid_shift)];
+        if cell.slot != EMPTY_SLOT && cell.key_packed == pack_key(wx, wz) {
+            return cell.slot;
+        }
+        if cell.overflow == 0 {
+            return EMPTY_SLOT;
+        }
+        self.map.get(&(wx, wz)).copied().unwrap_or(EMPTY_SLOT)
+    }
+    fn detach(&mut self, wx: i32, wz: i32) -> Option<u32> {
+        let slot = self.map.remove(&(wx, wz))?;
+        if self.grid_mask != 0 {
+            let idx = grid_index(wx, wz, self.grid_mask, self.grid_shift);
+            let cell = &mut self.grid[idx];
+            if cell.slot != EMPTY_SLOT && cell.key_packed == pack_key(wx, wz) {
+                cell.slot = EMPTY_SLOT;
+            } else {
+                debug_assert!(cell.overflow > 0);
+                cell.overflow -= 1;
+            }
+        }
+        Some(slot)
+    }
     /// Whether the section's connectivity changed.
     fn set(&mut self, key: SectionKey, vis: u64) -> bool {
         if !(0..self.sections).contains(&key.1) {
             return false;
         }
-        let column = match self.map.get_mut(&(key.0, key.2)) {
-            Some(column) => column,
-            None if vis == ALL_VISIBLE => return false,
-            None => self
-                .map
-                .entry((key.0, key.2))
-                .or_insert_with(|| vec![ALL_VISIBLE; self.sections as usize].into()),
-        };
-        let slot = &mut column[key.1 as usize];
-        if *slot == vis {
+        let y = key.1 as usize;
+        let slot = self.get_slot(key.0, key.2);
+        if slot == EMPTY_SLOT {
+            if vis == ALL_VISIBLE {
+                return false;
+            }
+            let new_slot = self.slab.alloc();
+            let base = new_slot as usize * self.slab.stride;
+            self.slab.rows[base + y] = vis;
+            self.slab.max_non_air[new_slot as usize] = y.min(usize::from(u8::MAX)) as u8;
+            self.map.insert((key.0, key.2), new_slot);
+            self.insert_grid_new(key.0, key.2, new_slot);
+            return true;
+        }
+        let base = slot as usize * self.slab.stride;
+        let entry = &mut self.slab.rows[base + y];
+        if *entry == vis {
             return false;
         }
-        *slot = vis;
-        if vis == ALL_VISIBLE && column.iter().all(|&v| v == ALL_VISIBLE) {
-            self.map.remove(&(key.0, key.2));
+        *entry = vis;
+        if vis != ALL_VISIBLE {
+            let max_y = &mut self.slab.max_non_air[slot as usize];
+            if y > usize::from(*max_y) {
+                *max_y = y.min(usize::from(u8::MAX)) as u8;
+            }
+            // Opportunistically promote an overflowed column into an empty
+            // toroidal cell so future lookups avoid `map`.
+            if self.grid_mask != 0 {
+                let idx = grid_index(key.0, key.2, self.grid_mask, self.grid_shift);
+                let cell = &mut self.grid[idx];
+                if cell.slot == EMPTY_SLOT {
+                    debug_assert!(cell.overflow > 0);
+                    cell.key_packed = pack_key(key.0, key.2);
+                    cell.slot = slot;
+                    cell.overflow -= 1;
+                }
+            }
+            return true;
+        }
+        let cur_max = usize::from(self.slab.max_non_air[slot as usize]);
+        if y < cur_max {
+            return true;
+        }
+        let scan_end = if cur_max == usize::from(u8::MAX) && self.slab.stride > 256 {
+            self.slab.stride
+        } else {
+            y
+        };
+        match self.slab.rows[base..base + scan_end]
+            .iter()
+            .rposition(|&v| v != ALL_VISIBLE)
+        {
+            Some(new_max) => {
+                self.slab.max_non_air[slot as usize] = new_max.min(usize::from(u8::MAX)) as u8;
+            }
+            None => {
+                debug_assert!(
+                    self.slab.rows[base..base + self.slab.stride]
+                        .iter()
+                        .all(|&v| v == ALL_VISIBLE)
+                );
+                let detached = self.detach(key.0, key.2);
+                debug_assert_eq!(detached, Some(slot));
+                self.slab.free(slot);
+            }
         }
         true
     }
+    #[inline]
     fn get(&self, key: SectionKey) -> u64 {
-        self.map
-            .get(&(key.0, key.2))
-            .and_then(|column| column.get(usize::try_from(key.1).ok()?))
-            .copied()
-            .unwrap_or(ALL_VISIBLE)
+        let Ok(y) = usize::try_from(key.1) else {
+            return ALL_VISIBLE;
+        };
+        if y >= self.slab.stride {
+            return ALL_VISIBLE;
+        }
+        let slot = self.get_slot(key.0, key.2);
+        if slot == EMPTY_SLOT {
+            return ALL_VISIBLE;
+        }
+        self.slab.rows[slot as usize * self.slab.stride + y]
+    }
+    fn clear(&mut self) {
+        let had_columns = !self.map.is_empty();
+        self.map.clear();
+        self.slab.clear();
+        if self.grid.len() > KEEP_GRID_MAX_LEN {
+            self.grid = Box::new([]);
+            self.grid_mask = 0;
+            self.grid_shift = 0;
+        } else if had_columns && self.grid_mask != 0 {
+            self.grid.fill(GridSlot::EMPTY);
+        }
     }
     fn apply(&mut self, edit: Edit) {
         match edit {
             Edit::Set(key, vis) => {
                 self.set(key, vis);
             }
-            Edit::Clear => self.map.clear(),
+            Edit::Clear => self.clear(),
         }
     }
+    #[cfg(test)]
+    fn assert_invariants(&self) {
+        assert_eq!(
+            self.slab.rows.len(),
+            self.slab.max_non_air.len() * self.slab.stride,
+            "slab rows length matches slot count * stride"
+        );
+        assert_eq!(
+            self.map.len() + self.slab.free_slots.len(),
+            self.slab.max_non_air.len(),
+            "live + free slots equals allocated slots"
+        );
+        let free: FxHashSet<u32> = self.slab.free_slots.iter().copied().collect();
+        assert_eq!(
+            free.len(),
+            self.slab.free_slots.len(),
+            "no duplicate free slots"
+        );
+        for (&(wx, wz), &slot) in &self.map {
+            assert!((slot as usize) < self.slab.max_non_air.len());
+            assert!(!free.contains(&slot), "live slot {slot} in free list");
+            let col = self.slab.column(slot);
+            let exact_max = col
+                .iter()
+                .rposition(|&v| v != ALL_VISIBLE)
+                .expect("live column has at least one non-air section");
+            assert_eq!(
+                usize::from(self.slab.max_non_air[slot as usize]),
+                exact_max.min(usize::from(u8::MAX)),
+                "max_non_air mismatch for ({wx}, {wz})"
+            );
+            if self.slab.max_non_air[slot as usize] == u8::MAX && self.slab.stride > 256 {
+                assert_eq!(self.slab.exact_max_non_air_y(slot), exact_max as i32);
+            }
+            assert_eq!(self.get_slot(wx, wz), slot);
+        }
+        if self.grid_mask == 0 {
+            assert!(self.map.is_empty(), "empty grid mask with live columns");
+        } else {
+            let side = 1usize << self.grid_shift;
+            assert_eq!(self.grid.len(), side * side);
+            assert_eq!(self.grid_mask, (side - 1) as i32);
+            let mut counts = vec![0usize; self.grid.len()];
+            for &(wx, wz) in self.map.keys() {
+                counts[grid_index(wx, wz, self.grid_mask, self.grid_shift)] += 1;
+            }
+            for (idx, (&cell, &expected)) in self.grid.iter().zip(&counts).enumerate() {
+                let present = usize::from(cell.slot != EMPTY_SLOT);
+                assert_eq!(
+                    present + cell.overflow as usize,
+                    expected,
+                    "toroidal cell {idx} accounting mismatch"
+                );
+                if cell.slot != EMPTY_SLOT {
+                    let wx = cell.key_packed as u32 as i32;
+                    let wz = (cell.key_packed >> 32) as u32 as i32;
+                    assert_eq!(
+                        grid_index(wx, wz, self.grid_mask, self.grid_shift),
+                        idx,
+                        "cached key in wrong toroidal cell"
+                    );
+                    assert_eq!(
+                        self.map.get(&(wx, wz)).copied(),
+                        Some(cell.slot),
+                        "cached slot disagrees with authoritative map"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// Reusable per-search scratch buffers held by the worker thread (and
+/// `Occlusion` for render-thread partial updates and fallback searches),
+/// avoiding per-search heap allocations.
+#[derive(Default)]
+struct SearchScratch {
+    /// Per `(dz * side + dx)` column in the searched box: slab slot index in
+    /// `ColumnSlab::rows`, or `EMPTY_SLOT` when the column is absent.
+    col_slots: Vec<u32>,
+    /// Reusable buffer for `Graph::seed_outside` when the camera is above or
+    /// below the world.
+    seeds: Vec<(i64, i32, i32, u8)>,
+    /// Reusable BFS frontier queue.
+    queue: VecDeque<QueueNode>,
 }
 
 #[derive(Clone, Copy)]
@@ -188,30 +556,15 @@ impl Graph {
     fn index(&self, key: SectionKey) -> Option<usize> {
         self.node(key).map(|n| n.index as usize)
     }
-    #[inline]
-    fn contains(&self, key: SectionKey) -> bool {
-        let ux = key.0.wrapping_sub(self.origin_x) as u32;
-        let uz = key.2.wrapping_sub(self.origin_z) as u32;
-        if ux >= self.side || uz >= self.side {
-            return false;
-        }
-        let uy = key.1.wrapping_sub(self.y0) as u32;
-        if uy < self.height_u {
-            let i = ((uz * self.side + ux) * self.height_u + uy) as usize;
-            self.directions[i] & REACHED != 0
-        } else {
-            // Everything above the highest non-air section is open sky. A
-            // full search can reach that layer from a neighbouring column,
-            // so checking only this column's top cell can hide an upper
-            // section that is visible through the open layer. Once any top
-            // cell is reached, conservatively keep the whole sky band visible.
-            self.sky_reached
-                && key.1 >= self.y0 + self.height
-                && (0..=self.sections).contains(&key.1)
-        }
-    }
-    /// Same answer as `contains`, reading the 8x denser L1-resident `bits`
+    /// Whether cell `i` was reached, reading the 8x denser L1-resident `bits`
     /// array kept in lockstep with `directions` by `set_reached`.
+    #[inline(always)]
+    fn is_reached(&self, i: usize) -> bool {
+        (self.bits[i >> 5] >> (i & 31)) & 1 != 0
+    }
+    /// Whether `key` is reached by this graph, reading the 8x denser
+    /// L1-resident `bits` array kept in lockstep with `directions` by
+    /// `set_reached`.
     #[inline]
     fn contains_bit(&self, key: SectionKey) -> bool {
         let ux = key.0.wrapping_sub(self.origin_x) as u32;
@@ -222,8 +575,13 @@ impl Graph {
         let uy = key.1.wrapping_sub(self.y0) as u32;
         if uy < self.height_u {
             let i = ((uz * self.side + ux) * self.height_u + uy) as usize;
-            (self.bits[i >> 5] >> (i & 31)) & 1 != 0
+            self.is_reached(i)
         } else {
+            // Everything above the highest non-air section is open sky. A
+            // full search can reach that layer from a neighbouring column,
+            // so checking only this column's top cell can hide an upper
+            // section that is visible through the open layer. Once any top
+            // cell is reached, conservatively keep the whole sky band visible.
             self.sky_reached
                 && key.1 >= self.y0 + self.height
                 && (0..=self.sections).contains(&key.1)
@@ -243,8 +601,7 @@ impl Graph {
         columns: &Columns,
         camera: DVec3,
         radius: i32,
-        vis: &mut Vec<u64>,
-        queue: &mut VecDeque<QueueNode>,
+        scratch: &mut SearchScratch,
     ) {
         let from = columns.section_of(camera);
         let origin_x = from.0 - radius;
@@ -259,34 +616,55 @@ impl Graph {
         self.sections = columns.sections;
         self.y0 = -1;
 
-        let mut present: Vec<(usize, &[u64])> = Vec::new();
-        if from.1 >= columns.sections {
-            self.height = columns.sections + 2;
+        let area = side * side;
+        scratch.col_slots.resize(area, EMPTY_SLOT);
+        let compute_clamp = from.1 < columns.sections;
+        let mut max_non_air_y = 0;
+        if columns.map.is_empty() {
+            scratch.col_slots.fill(EMPTY_SLOT);
         } else {
-            let mut max_non_air_y = 0;
+            debug_assert_ne!(columns.grid_mask, 0);
+            let grid = &columns.grid;
+            let mask = columns.grid_mask;
+            let shift = columns.grid_shift;
+            let wide_sections = columns.sections > 256;
             for dz in 0..side {
                 let wz = origin_z + dz as i32;
-                let row = dz * side;
-                for dx in 0..side {
+                let z_base = ((wz & mask) as usize) << shift;
+                let wz_hi = u64::from(wz as u32) << 32;
+                let row_out = &mut scratch.col_slots[dz * side..(dz + 1) * side];
+                for (dx, slot_out) in row_out.iter_mut().enumerate() {
                     let wx = origin_x + dx as i32;
-                    let Some(column) = columns.map.get(&(wx, wz)) else {
-                        continue;
+                    let cell = grid[z_base | ((wx & mask) as usize)];
+                    let slot = if cell.slot != EMPTY_SLOT
+                        && cell.key_packed == (u64::from(wx as u32) | wz_hi)
+                    {
+                        cell.slot
+                    } else if cell.overflow == 0 {
+                        EMPTY_SLOT
+                    } else {
+                        columns.map.get(&(wx, wz)).copied().unwrap_or(EMPTY_SLOT)
                     };
-                    present.push((row + dx, column));
-                    for (y, &v) in column.iter().enumerate().rev() {
-                        let y = y as i32;
-                        if y <= max_non_air_y {
-                            break;
-                        }
-                        if v != ALL_VISIBLE {
-                            max_non_air_y = y;
-                            break;
+                    *slot_out = slot;
+                    if compute_clamp && slot != EMPTY_SLOT {
+                        let m = columns.slab.max_non_air[slot as usize];
+                        let col_max = if wide_sections && m == u8::MAX {
+                            columns.slab.exact_max_non_air_y(slot)
+                        } else {
+                            i32::from(m)
+                        };
+                        if col_max > max_non_air_y {
+                            max_non_air_y = col_max;
                         }
                     }
                 }
             }
+        }
+        if compute_clamp {
             let top_y = max_non_air_y.max(from.1);
             self.height = (top_y + 3).max(3).min(columns.sections + 2);
+        } else {
+            self.height = columns.sections + 2;
         }
         self.height_u = self.height as u32;
         let h = self.height as usize;
@@ -301,38 +679,30 @@ impl Graph {
         self.rays.clear();
         self.rays
             .resize((side + 1) * (side + 1) * (self.height + 1) as usize, 0);
-        vis.clear();
-        vis.resize(size, ALL_VISIBLE);
-        if from.1 >= columns.sections {
-            for dz in 0..side {
-                let wz = origin_z + dz as i32;
-                let row = dz * side;
-                for dx in 0..side {
-                    let wx = origin_x + dx as i32;
-                    let Some(column) = columns.map.get(&(wx, wz)) else {
-                        continue;
-                    };
-                    let base = (row + dx) * h + 1;
-                    let len = (column.len() as i32).min(self.height - 1) as usize;
-                    vis[base..base + len].copy_from_slice(&column[..len]);
-                }
-            }
-        } else {
-            for (col_idx, column) in present {
-                let base = col_idx * h + 1;
-                let len = (column.len() as i32).min(self.height - 1) as usize;
-                vis[base..base + len].copy_from_slice(&column[..len]);
-            }
-        }
-        queue.clear();
+        scratch.queue.clear();
         if (0..columns.sections).contains(&from.1) {
             let start = self.node(from).expect("camera inside the searched box");
             self.set_reached(start.index as usize, REACHED);
-            queue.push_back(start);
+            scratch.queue.push_back(start);
         } else {
-            self.seed_outside(camera, queue);
+            self.seed_outside(camera, scratch);
         }
-        self.propagate(queue, camera, true, |i, _| vis[i]);
+        let col_slots = &scratch.col_slots;
+        let rows = &columns.slab.rows;
+        let stride = columns.slab.stride;
+        self.propagate(&mut scratch.queue, camera, true, |node, key| {
+            let slot = col_slots[usize::from(node.uz) * side + usize::from(node.ux)];
+            if slot == EMPTY_SLOT {
+                return ALL_VISIBLE;
+            }
+            let Ok(y) = usize::try_from(key.1) else {
+                return ALL_VISIBLE;
+            };
+            if y >= stride {
+                return ALL_VISIBLE;
+            }
+            rows[slot as usize * stride + y]
+        });
     }
     /// `initializeQueueForFullUpdate` with the camera above or below the
     /// world (no render section there): every section of the world's top
@@ -342,7 +712,7 @@ impl Graph {
     /// centre (a stable sort over vanilla's x-then-z loop). Vanilla seeds only
     /// columns in view distance; this search covers its whole box, as it does
     /// from inside the world.
-    fn seed_outside(&mut self, camera: DVec3, queue: &mut VecDeque<QueueNode>) {
+    fn seed_outside(&mut self, camera: DVec3, scratch: &mut SearchScratch) {
         // Direction order: down, up, north, south, west, east.
         let (y, travel) = if self.from.1 < 0 {
             (0, 1)
@@ -350,7 +720,9 @@ impl Graph {
             (self.sections - 1, 0)
         };
         let block = (camera.x.floor() as i64, camera.z.floor() as i64);
-        let mut seeds = Vec::with_capacity(((2 * self.radius + 1) as usize).pow(2));
+        let side = (2 * self.radius + 1) as usize;
+        scratch.seeds.clear();
+        scratch.seeds.reserve(side * side);
         for dx in -self.radius..=self.radius {
             for dz in -self.radius..=self.radius {
                 let mut directions = REACHED | 1 << travel;
@@ -370,11 +742,16 @@ impl Graph {
                     block.0 - centre(self.from.0 + dx),
                     block.1 - centre(self.from.2 + dz),
                 );
-                seeds.push((ox * ox + oz * oz, dx, dz, directions));
+                scratch.seeds.push((ox * ox + oz * oz, dx, dz, directions));
             }
         }
-        seeds.sort_by_key(|seed| seed.0);
-        for (_, dx, dz, directions) in seeds {
+        // `(dx, dz)` increases strictly in the outer/inner loops above, so
+        // sorting by `(dist_sq, dx, dz)` is an exact total order matching
+        // vanilla's stable sort by `dist_sq` without heap scratch allocation.
+        scratch
+            .seeds
+            .sort_unstable_by_key(|&(dist, dx, dz, _)| (dist, dx, dz));
+        for &(_, dx, dz, directions) in &scratch.seeds {
             let node = self
                 .node((self.from.0 + dx, y, self.from.2 + dz))
                 .expect("seed inside the searched box");
@@ -382,7 +759,7 @@ impl Graph {
             self.set_reached(i, directions);
             // Entered through the face opposite the travel (`sourceDirection`).
             self.entered[i] = 1 << (travel ^ 1);
-            queue.push_back(node);
+            scratch.queue.push_back(node);
         }
     }
     /// Vanilla's `runUpdates`: take nodes from the queue and step through
@@ -395,7 +772,7 @@ impl Graph {
         queue: &mut VecDeque<QueueNode>,
         camera: DVec3,
         full: bool,
-        vis: impl Fn(usize, SectionKey) -> u64,
+        vis: impl Fn(QueueNode, SectionKey) -> u64,
     ) -> bool {
         let mut grew = false;
         let eye = (
@@ -422,12 +799,11 @@ impl Graph {
                 self.y0 + i32::from(uy),
                 self.origin_z + i32::from(uz),
             );
-            let directions = self.directions[i];
             let entered = self.entered[i];
             let exits = if entered == 0 {
                 0x3f
             } else {
-                let v = vis(i, key);
+                let v = vis(node, key);
                 if v == ALL_VISIBLE {
                     0x3f
                 } else if v == 0 {
@@ -443,6 +819,10 @@ impl Graph {
                     out & 0x3f
                 }
             };
+            if exits == 0 {
+                continue;
+            }
+            let directions = self.directions[i];
             // Block steps opposite any already-travelled direction (`d ^ 1`).
             let blocked = ((directions & 0x15) << 1) | ((directions & 0x2a) >> 1);
             let mut mask = exits & !blocked;
@@ -509,7 +889,7 @@ impl Graph {
                         continue;
                     }
                 }
-                if self.directions[n] & REACHED == 0 {
+                if !self.is_reached(n) {
                     self.set_reached(n, directions | 1 << d);
                     self.entered[n] = 1 << (d ^ 1);
                     queue.push_back(QueueNode {
@@ -615,7 +995,7 @@ impl Graph {
                 (floor(check[1]) - self.min_y) >> 4,
                 floor(check[2]) >> 4,
             );
-            if !self.contains(section) {
+            if !self.contains_bit(section) {
                 // A count too long to keep (`SEES`) starts over next time.
                 return Some(if sample == SEES { 0 } else { sample });
             }
@@ -645,7 +1025,7 @@ pub struct Reach<'a> {
 #[cfg(test)]
 impl Reach<'_> {
     /// gpu_culling.wgsl's `reached`, statement for statement: what
-    /// `Graph::contains` answers.
+    /// `Graph::contains_bit` answers.
     #[inline]
     pub fn contains(&self, key: SectionKey) -> bool {
         let r = self.radius;
@@ -701,13 +1081,13 @@ impl Worker {
             .name("occlusion".into())
             .spawn(move || {
                 let mut columns = Columns::new(min_y, sections);
-                let (mut vis, mut queue) = (Vec::new(), VecDeque::new());
+                let mut scratch = SearchScratch::default();
                 while let Ok(mut job) = job_rx.recv() {
                     for edit in job.edits.drain(..) {
                         columns.apply(edit);
                     }
                     job.graph
-                        .search(&columns, job.camera, job.radius, &mut vis, &mut queue);
+                        .search(&columns, job.camera, job.radius, &mut scratch);
                     if done_tx.send((job.graph, job.edits)).is_err() {
                         break;
                     }
@@ -751,8 +1131,7 @@ pub struct Occlusion {
     /// Sections changed since the running search started: they propagate into
     /// its graph when it lands.
     changed_late: Vec<SectionKey>,
-    vis: Vec<u64>,
-    queue: VecDeque<QueueNode>,
+    scratch: SearchScratch,
     /// Changes whenever `contains` may answer differently (`generation`).
     generation: u64,
     /// Set when edits were dropped; the next search resends every column.
@@ -774,8 +1153,7 @@ impl Occlusion {
             searched: None,
             changed: Vec::new(),
             changed_late: Vec::new(),
-            vis: Vec::new(),
-            queue: VecDeque::new(),
+            scratch: SearchScratch::default(),
             generation: next_generation(),
             resync: false,
         }
@@ -807,8 +1185,10 @@ impl Occlusion {
         self.resync = false;
         self.edits.clear();
         self.edits.push(Edit::Clear);
-        for (&(x, z), column) in &self.columns.map {
-            for (y, &vis) in column.iter().enumerate() {
+        for (&(x, z), &slot) in &self.columns.map {
+            let col = self.columns.slab.column(slot);
+            let top = self.columns.slab.scan_len(slot);
+            for (y, &vis) in col[..top].iter().enumerate() {
                 if vis != ALL_VISIBLE {
                     self.edits.push(Edit::Set((x, y as i32, z), vis));
                 }
@@ -817,14 +1197,17 @@ impl Occlusion {
     }
     /// Every section of the column `x`, `z` goes (sees through every face).
     pub fn remove_column(&mut self, x: i32, z: i32) {
-        let Some(column) = self.columns.map.remove(&(x, z)) else {
+        let Some(slot) = self.columns.detach(x, z) else {
             return;
         };
-        for (y, &vis) in column.iter().enumerate() {
-            if vis != ALL_VISIBLE {
+        let base = slot as usize * self.columns.slab.stride;
+        let top = self.columns.slab.scan_len(slot);
+        for y in 0..top {
+            if self.columns.slab.rows[base + y] != ALL_VISIBLE {
                 self.changed((x, y as i32, z), ALL_VISIBLE);
             }
         }
+        self.columns.slab.free(slot);
     }
     /// `remove_column` for each of `gone`. When they are every column it holds (a
     /// teleport drops the whole view), the old graph says nothing about what arrives
@@ -840,7 +1223,7 @@ impl Occlusion {
         }
     }
     pub fn clear(&mut self) {
-        self.columns.map.clear();
+        self.columns.clear();
         self.edits.clear();
         self.edits.push(Edit::Clear);
         self.resync = false;
@@ -943,7 +1326,7 @@ impl Occlusion {
         if self.resync {
             self.resync_edits();
         }
-        let graph = std::mem::take(&mut self.spare);
+        let mut graph = std::mem::take(&mut self.spare);
         if let Some(worker) = &self.worker {
             let job = Job {
                 edits: std::mem::take(&mut self.edits),
@@ -951,23 +1334,23 @@ impl Occlusion {
                 radius,
                 graph,
             };
-            if worker.jobs.send(job).is_ok() {
-                self.running = Some((from, radius));
-                self.changed_late.clear();
-                return;
+            match worker.jobs.send(job) {
+                Ok(()) => {
+                    self.running = Some((from, radius));
+                    self.changed_late.clear();
+                    return;
+                }
+                Err(mpsc::SendError(job)) => {
+                    graph = job.graph;
+                    log::warn!(
+                        "Horizon: the occlusion worker stopped; culling on the render thread"
+                    );
+                    self.worker = None;
+                }
             }
-            log::warn!("Horizon: the occlusion worker stopped; culling on the render thread");
-            self.worker = None;
         }
         self.edits.clear();
-        let mut graph = Graph::default();
-        graph.search(
-            &self.columns,
-            camera,
-            radius,
-            &mut self.vis,
-            &mut self.queue,
-        );
+        graph.search(&self.columns, camera, radius, &mut self.scratch);
         self.land(graph);
     }
     fn collect(&mut self, wait: bool) {
@@ -1016,16 +1399,24 @@ impl Occlusion {
             self.changed.clear();
             return;
         };
-        self.queue.clear();
+        if self.changed.is_empty() {
+            return;
+        }
+        self.scratch.queue.clear();
         for key in self.changed.drain(..) {
             if let Some(node) = graph.node(key)
-                && graph.directions[node.index as usize] & REACHED != 0
+                && graph.is_reached(node.index as usize)
             {
-                self.queue.push_back(node);
+                self.scratch.queue.push_back(node);
             }
         }
+        if self.scratch.queue.is_empty() {
+            return;
+        }
         let columns = &self.columns;
-        if graph.propagate(&mut self.queue, camera, false, |_, key| columns.get(key)) {
+        if graph.propagate(&mut self.scratch.queue, camera, false, |_, key| {
+            columns.get(key)
+        }) {
             self.generation = next_generation();
         }
     }
